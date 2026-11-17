@@ -17,12 +17,19 @@
 
 name: CI Hadoop 3
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional Maven test selector (e.g. -Dtest=Foo) to scope the verify step'
+        required: false
+        default: ''
 
 jobs:
   build:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -37,11 +44,27 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.java.setup }}
+          cache: maven
+      - name: Cache thrift compiler
+        id: thrift-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/thrift-bin
+          key: thrift-compiler-${{ runner.os }}-${{ hashFiles('dev/ci-before_install.sh') }}
+      - name: Install cached thrift compiler
+        if: steps.thrift-cache.outputs.cache-hit == 'true'
+        run: |
+          sudo cp ~/thrift-bin/thrift /usr/local/bin/thrift
+          sudo chmod +x /usr/local/bin/thrift
+          thrift --version
       - name: before_install
+        if: steps.thrift-cache.outputs.cache-hit != 'true'
         env:
           CI_TARGET_BRANCH: $GITHUB_HEAD_REF
         run: |
           bash dev/ci-before_install.sh
+          mkdir -p ~/thrift-bin
+          cp /usr/local/bin/thrift ~/thrift-bin/thrift
       - name: install
         run: |
           EXTRA_JAVA_TEST_ARGS=$(./mvnw help:evaluate -Dexpression=extraJavaTestArgs -q -DforceStdout)
@@ -54,4 +77,42 @@ jobs:
         run: |
           EXTRA_JAVA_TEST_ARGS=$(./mvnw help:evaluate -Dexpression=extraJavaTestArgs -q -DforceStdout)
           export MAVEN_OPTS="$MAVEN_OPTS $EXTRA_JAVA_TEST_ARGS"
-          ./mvnw verify --batch-mode javadoc:javadoc
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw verify --batch-mode javadoc:javadoc -Drat.skip=true -Dspotless.check.skip=true -Djapicmp.skip=true -Dsurefire.failIfNoSpecifiedTests=false ${{ inputs.test-filter }}
+          else
+            ./mvnw verify --batch-mode javadoc:javadoc -Drat.skip=true -Dspotless.check.skip=true -Djapicmp.skip=true
+          fi
+      - name: Vectored IO bridge tests against Hadoop 3.3.6
+        # TestFileRangeBridge/TestVectorIoBridge assume-skip on the default hadoop.version 3.3.0,
+        # which predates org.apache.hadoop.fs.FileRange (added in Hadoop 3.3.5); re-run them on 3.3.6.
+        if: inputs.test-filter == ''
+        run: |
+          ./mvnw test --batch-mode -pl parquet-hadoop -Dhadoop.version=3.3.6 -Drat.skip=true -Dspotless.check.skip=true -Djapicmp.skip=true -Dtest=TestFileRangeBridge,TestVectorIoBridge -Dsurefire.failIfNoSpecifiedTests=false
+      - name: Test summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET, collections
+          t=f=e=s=0
+          skips=collections.defaultdict(list)
+          for path in glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True):
+              r=ET.parse(path).getroot()
+              t+=int(r.get('tests',0)); f+=int(r.get('failures',0)); e+=int(r.get('errors',0)); s+=int(r.get('skipped',0))
+              for tc in r.iter('testcase'):
+                  sk=tc.find('skipped')
+                  if sk is not None:
+                      skips[(sk.get('message') or 'no message').strip()[:200]].append(tc.get('classname','').split('.')[-1]+'.'+tc.get('name',''))
+          print('SKIPPED TESTS BY REASON:')
+          for reason, names in skips.items():
+              print(f'  [{len(names)}] {reason}: ' + ', '.join(names))
+          print(f'TEST SUMMARY: Tests run: {t}, passed: {t-f-e-s}, failed: {f}, errors: {e}, skipped: {s}')
+          PY
+      - name: Upload parquet-format-structures artifacts
+        if: matrix.java.setup == '11' && matrix.codes == 'uncompressed,brotli'
+        uses: actions/upload-artifact@v4
+        with:
+          name: parquet-format-structures-jars
+          path: |
+            parquet-format-structures/target/parquet-format-structures-1.17.1.jar
+            parquet-format-structures/target/parquet-format-structures-1.17.1-tests.jar
+          if-no-files-found: error
